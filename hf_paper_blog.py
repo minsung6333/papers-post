@@ -163,38 +163,14 @@ def fetch_arxiv_content(arxiv_id: str) -> dict:
     if current_text:
         sections[current_section] = " ".join(current_text).strip()
 
-    raw_figures = []
-    for img in soup.select("figure img, .ltx_figure img"):
-        src = img.get("src", "")
-        if src:
-            url = src if src.startswith("http") else f"https://arxiv.org/html/{arxiv_id}/{src.lstrip('/')}"
-            raw_figures.append(url)
-
     captions = [cap.get_text(" ", strip=True)[:300] for cap in soup.select("figcaption")]
-    figures = _filter_accessible_images(raw_figures)
 
     return {
         "sections": sections,
-        "figures": figures,
+        "figures": [],      # arXiv HTML 이미지는 PDF 렌더링이라 신뢰 불가 → HF 썸네일만 사용
         "captions": captions,
         "full_text": soup.get_text(" ", strip=True)[:15000],
     }
-
-
-def _filter_accessible_images(urls: list, max_check: int = 6, timeout: int = 5) -> list:
-    """실제로 로드 가능한 이미지 URL만 반환"""
-    valid = []
-    for url in urls[:max_check]:
-        try:
-            resp = requests.head(url, timeout=timeout, allow_redirects=True,
-                                 headers={"User-Agent": "Mozilla/5.0"})
-            if resp.status_code == 200:
-                ct = resp.headers.get("content-type", "")
-                if "image" in ct or any(url.lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".gif", ".webp")):
-                    valid.append(url)
-        except Exception:
-            pass
-    return valid
 
 
 # ============================================================
@@ -210,14 +186,8 @@ def generate_korean_post(paper: dict, arxiv_content: dict, client: anthropic.Ant
     published = paper.get("publishedAt", "")[:10]
     hf_thumbnail = paper.get("thumbnailUrl", "")
 
-    # HF 썸네일(항상 접근 가능)을 첫 번째로, 검증된 arXiv 그림을 이어서
-    all_figures = ([hf_thumbnail] if hf_thumbnail else []) + arxiv_content["figures"][:5]
-    all_captions = (["논문 요약 썸네일"] if hf_thumbnail else []) + (arxiv_content["captions"][:5] + [""]*5)
-
-    figures_md = "\n".join(
-        f'![Figure {i+1}: {cap[:100]}]({url})'
-        for i, (url, cap) in enumerate(zip(all_figures, all_captions))
-    )
+    # HF 썸네일만 신뢰성 있는 이미지로 사용
+    figures_md = f"![논문 썸네일]({hf_thumbnail})" if hf_thumbnail else ""
 
     sections_text = "\n\n".join(
         f"## {sec}\n{text[:2000]}"
@@ -538,29 +508,61 @@ def markdown_to_notion_blocks(markdown_text: str) -> list:
     return blocks
 
 
-def post_to_notion(paper: dict, post_content: str, notion_api_key: str, database_id: str) -> str:
-    """Notion 데이터베이스에 페이지 생성"""
+def setup_notion_database_schema(database_id: str, notion_api_key: str) -> None:
+    """DB에 날짜/업보트/arXiv/태그 속성 추가 (이미 있으면 무시)"""
     headers = {
         "Authorization": f"Bearer {notion_api_key}",
         "Content-Type": "application/json",
-        "Notion-Version": "2022-06-28"
+        "Notion-Version": "2022-06-28",
+    }
+    requests.patch(
+        f"https://api.notion.com/v1/databases/{database_id}",
+        headers=headers,
+        json={
+            "properties": {
+                "Published": {"date": {}},
+                "Upvotes": {"number": {"format": "number"}},
+                "arXiv": {"url": {}},
+                "Tags": {"multi_select": {}},
+            }
+        },
+        timeout=30,
+    ).raise_for_status()
+
+
+def post_to_notion(paper: dict, post_content: str, notion_api_key: str, database_id: str) -> str:
+    """Notion 데이터베이스에 페이지 생성 (커버/아이콘/속성 포함)"""
+    headers = {
+        "Authorization": f"Bearer {notion_api_key}",
+        "Content-Type": "application/json",
+        "Notion-Version": "2022-06-28",
     }
 
     title = paper.get("title", "제목 없음")
     arxiv_id = paper.get("id", "")
+    published = paper.get("publishedAt", "")[:10]
+    upvotes = paper.get("upvotes", 0)
+    thumbnail = paper.get("thumbnailUrl", "")
+    tags = _extract_tags(post_content)
 
     all_blocks = markdown_to_notion_blocks(post_content)
 
-    # 첫 100개 블록으로 페이지 생성
     page_data = {
         "parent": {"database_id": database_id},
+        "icon": {"type": "emoji", "emoji": "📄"},
         "properties": {
-            "Name": {
-                "title": [{"text": {"content": title[:255]}}]
-            }
+            "Name": {"title": [{"text": {"content": title[:255]}}]},
+            "Upvotes": {"number": upvotes},
+            "arXiv": {"url": f"https://arxiv.org/abs/{arxiv_id}"},
+            "Tags": {"multi_select": [{"name": t} for t in tags[:5]]},
         },
-        "children": all_blocks[:100]
+        "children": all_blocks[:100],
     }
+
+    if thumbnail:
+        page_data["cover"] = {"type": "external", "external": {"url": thumbnail}}
+    if published:
+        page_data["properties"]["Published"] = {"date": {"start": published}}
 
     resp = requests.post("https://api.notion.com/v1/pages", headers=headers, json=page_data)
     resp.raise_for_status()
@@ -569,11 +571,10 @@ def post_to_notion(paper: dict, post_content: str, notion_api_key: str, database
     # 나머지 블록 100개씩 추가
     remaining = all_blocks[100:]
     for j in range(0, len(remaining), 100):
-        chunk = remaining[j:j+100]
         requests.patch(
             f"https://api.notion.com/v1/blocks/{page_id}/children",
             headers=headers,
-            json={"children": chunk}
+            json={"children": remaining[j:j+100]},
         ).raise_for_status()
         time.sleep(0.3)
 
@@ -670,6 +671,12 @@ def main():
 
     if velog_refresh:
         check_token_expiry_and_notify(velog_refresh)
+
+    if use_notion:
+        try:
+            setup_notion_database_schema(notion_db_id, notion_key)
+        except Exception as e:
+            print(f"DB schema setup failed (non-fatal): {e}")
 
     client = anthropic.Anthropic(api_key=anthropic_key)
 
