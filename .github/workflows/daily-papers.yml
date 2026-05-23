@@ -29,4 +29,6 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          VELOG_ACCESS_TOKEN: ${{ secrets.VELOG_ACCESS_TOKEN }}
+          VELOG_REFRESH_TOKEN: ${{ secrets.VELOG_REFRESH_TOKEN }}
         run: python hf_paper_blog.py

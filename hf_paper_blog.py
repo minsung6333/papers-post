@@ -257,6 +257,88 @@ def generate_korean_post(paper: dict, arxiv_content: dict, client: anthropic.Ant
 
 
 # ============================================================
+# Velog 업로드
+# ============================================================
+
+VELOG_GQL = "https://v3.velog.io/graphql"
+
+
+def _extract_tags(post_content: str) -> list:
+    """포스트 하단 태그 섹션에서 태그 추출"""
+    match = re.search(r'(?:태그|Tags?)[:\s#]*([#\w,\s가-힣A-Za-z0-9_-]+)', post_content, re.IGNORECASE)
+    if match:
+        tags = re.findall(r'#?([\w가-힣A-Za-z0-9_-]+)', match.group(1))
+        return [t for t in tags if len(t) > 1][:10]
+    return ["AI", "LLM", "NLP"]
+
+
+def refresh_velog_token(refresh_token: str) -> str:
+    """refresh_token으로 새 access_token 발급"""
+    query = "mutation RefreshToken { refreshToken { access_token refresh_token } }"
+    resp = requests.post(
+        VELOG_GQL,
+        json={"query": query},
+        headers={"Content-Type": "application/json", "cookie": f"refresh_token={refresh_token}"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()["data"]["refreshToken"]["access_token"]
+
+
+def post_to_velog(paper: dict, post_content: str, access_token: str, refresh_token: str) -> str:
+    """Velog에 포스트 업로드, access_token 만료 시 자동 갱신"""
+    title = paper.get("title", "")
+    url_slug = slugify(title)
+    tags = _extract_tags(post_content)
+
+    mutation = """
+    mutation WritePost($input: WritePostInput!) {
+        writePost(input: $input) {
+            id
+            url_slug
+            user { username }
+        }
+    }
+    """
+    variables = {
+        "input": {
+            "title": title,
+            "body": post_content,
+            "tags": tags,
+            "is_markdown": True,
+            "is_temp": False,
+            "is_private": False,
+            "url_slug": url_slug,
+            "thumbnail": None,
+            "meta": {},
+            "series_id": None,
+        }
+    }
+
+    def _do_post(token: str) -> dict:
+        resp = requests.post(
+            VELOG_GQL,
+            json={"query": mutation, "variables": variables},
+            headers={"Content-Type": "application/json", "cookie": f"access_token={token}"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    data = _do_post(access_token)
+
+    if "errors" in data:
+        print(f"  access_token 만료 → refresh 시도 중...")
+        new_token = refresh_velog_token(refresh_token)
+        data = _do_post(new_token)
+
+    post = data["data"]["writePost"]
+    username = post["user"]["username"]
+    slug = post["url_slug"]
+    return f"https://velog.io/@{username}/{slug}"
+
+
+# ============================================================
 # Notion 업로드
 # ============================================================
 
@@ -485,22 +567,27 @@ def main():
     anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
     notion_key = os.environ.get("NOTION_API_KEY", "")
     notion_db_id = os.environ.get("NOTION_DATABASE_ID", "")
+    velog_access = os.environ.get("VELOG_ACCESS_TOKEN", "")
+    velog_refresh = os.environ.get("VELOG_REFRESH_TOKEN", "")
 
     if not anthropic_key:
-        print("❌ ANTHROPIC_API_KEY 환경변수가 없습니다.")
+        print("ANTHROPIC_API_KEY 환경변수가 없습니다.")
         return
     if not notion_key:
-        print("⚠️  NOTION_API_KEY 없음 → Notion 업로드 건너뜀")
+        print("NOTION_API_KEY 없음 -> Notion 업로드 건너뜀")
     if not notion_db_id:
-        print("⚠️  NOTION_DATABASE_ID 없음 → Notion 업로드 건너뜀")
+        print("NOTION_DATABASE_ID 없음 -> Notion 업로드 건너뜀")
+    if not velog_access:
+        print("VELOG_ACCESS_TOKEN 없음 -> Velog 업로드 건너뜀")
 
     use_notion = bool(notion_key and notion_db_id)
+    use_velog = bool(velog_access and velog_refresh)
     client = anthropic.Anthropic(api_key=anthropic_key)
 
     today = datetime.date.today()
-    print(f"\n🚀 HuggingFace Daily Papers 블로그 자동 생성")
-    print(f"📅 날짜: {today}")
-    print(f"📬 Notion 업로드: {'✅ ON' if use_notion else '❌ OFF'}\n")
+    print(f"\nHuggingFace Daily Papers blog auto-generation")
+    print(f"Date: {today}")
+    print(f"Notion: {'ON' if use_notion else 'OFF'} | Velog: {'ON' if use_velog else 'OFF'}\n")
 
     if SAVE_LOCAL:
         output_dir = OUTPUT_DIR / str(today.year) / f"{today.month:02d}"
@@ -543,9 +630,16 @@ def main():
         if use_notion:
             try:
                 page_id = post_to_notion(paper, post_content, notion_key, notion_db_id)
-                print(f"  ✅ Notion 업로드 완료: {page_id}")
+                print(f"  Notion upload done: {page_id}")
             except Exception as e:
-                print(f"  ❌ Notion 업로드 실패: {e}")
+                print(f"  Notion upload failed: {e}")
+
+        if use_velog:
+            try:
+                velog_url = post_to_velog(paper, post_content, velog_access, velog_refresh)
+                print(f"  Velog upload done: {velog_url}")
+            except Exception as e:
+                print(f"  Velog upload failed: {e}")
 
         success += 1
         time.sleep(3)
