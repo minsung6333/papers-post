@@ -1,0 +1,32 @@
+name: Daily HF Papers Blog
+
+on:
+  schedule:
+    # 매일 오전 9시 KST (= 0시 UTC)
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    # 수동 실행 버튼 (테스트용)
+
+jobs:
+  generate-posts:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 패키지 설치
+        run: |
+          pip install anthropic requests beautifulsoup4 lxml
+
+      - name: 블로그 포스트 생성 및 Notion 업로드
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+        run: python hf_paper_blog.py
