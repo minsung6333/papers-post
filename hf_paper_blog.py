@@ -14,6 +14,7 @@ import re
 import time
 import requests
 import datetime
+import xml.etree.ElementTree as ET
 from pathlib import Path
 import anthropic
 from bs4 import BeautifulSoup
@@ -25,26 +26,100 @@ SAVE_LOCAL = True    # 로컬에도 .md 파일 저장할지 여부
 OUTPUT_DIR = Path("./posts")
 # =================================================
 
-LLM_NLP_KEYWORDS = [
-    "language model", "llm", "nlp", "transformer", "attention",
-    "tokeniz", "fine-tun", "pre-train", "rlhf", "instruction",
-    "reasoning", "chain-of-thought", "prompt", "agent", "rag",
-    "retrieval", "generation", "summariz", "translation", "embedding",
-    "in-context", "few-shot", "zero-shot", "alignment", "sft",
-    "reinforcement learning", "reward model", "moe", "mixture of experts",
-    "long-context", "context window", "inference", "decoding",
-    "hallucination", "benchmark", "evaluation", "multimodal llm",
-    "speech", "asr", "text-to-speech", "diffusion language",
-]
+# cs.CL → LLM/NLP 확정, 나머지 → Claude Haiku로 2차 판별
+NLP_PRIMARY_CATS = {"cs.CL"}
+NLP_AMBIGUOUS_CATS = {"cs.AI", "cs.LG", "cs.IR", "cs.NE", "stat.ML"}
 
 
 # ============================================================
 # 논문 수집
 # ============================================================
 
-def is_llm_nlp_paper(title: str, abstract: str) -> bool:
-    text = (title + " " + abstract).lower()
-    return any(kw in text for kw in LLM_NLP_KEYWORDS)
+def fetch_arxiv_categories_batch(arxiv_ids: list) -> dict:
+    """arXiv API로 여러 논문 카테고리 단일 요청으로 조회"""
+    id_list = ",".join(arxiv_ids)
+    url = f"http://export.arxiv.org/api/query?id_list={id_list}&max_results={len(arxiv_ids)}"
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"  arXiv 카테고리 조회 실패: {e}")
+        return {}
+
+    ns = {
+        "atom": "http://www.w3.org/2005/Atom",
+        "arxiv": "http://arxiv.org/schemas/atom",
+    }
+    root = ET.fromstring(resp.text)
+    result = {}
+    for entry in root.findall("atom:entry", ns):
+        id_elem = entry.find("atom:id", ns)
+        if id_elem is None:
+            continue
+        arxiv_id = id_elem.text.split("/abs/")[-1].split("v")[0]
+        cats = []
+        primary = entry.find("arxiv:primary_category", ns)
+        if primary is not None:
+            cats.append(primary.get("term", ""))
+        for cat in entry.findall("atom:category", ns):
+            term = cat.get("term", "")
+            if term and term not in cats:
+                cats.append(term)
+        result[arxiv_id] = cats
+    return result
+
+
+def classify_with_claude_haiku(papers: list, client: anthropic.Anthropic) -> list:
+    """Claude Haiku로 LLM/NLP 관련 논문 배치 판별"""
+    if not papers:
+        return []
+
+    paper_list = "\n".join(
+        f"{i+1}. 제목: {p.get('title', '')}\n   초록: {p.get('summary', '')[:300]}"
+        for i, p in enumerate(papers)
+    )
+    prompt = f"""다음 논문들 중 LLM(대형 언어 모델), NLP(자연어 처리), 생성 AI와 직접 관련된 논문의 번호만 나열하세요.
+컴퓨터 비전만 다루거나 로봇공학, 순수 수학 등 NLP와 무관한 논문은 제외하세요.
+번호만 쉼표로 구분해서 답하세요. 예: 1, 3, 5
+
+{paper_list}"""
+
+    resp = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=100,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text = resp.content[0].text.strip()
+    try:
+        indices = [int(x.strip()) - 1 for x in re.split(r"[,\s]+", text) if x.strip().isdigit()]
+        return [papers[i] for i in indices if 0 <= i < len(papers)]
+    except Exception:
+        return []
+
+
+def filter_llm_papers(papers: list, client: anthropic.Anthropic) -> list:
+    """arXiv 카테고리(1차) + Claude Haiku(2차) 이중 필터링"""
+    arxiv_ids = [p["id"] for p in papers]
+    print(f"  [1/2] arXiv 카테고리 조회 중... ({len(arxiv_ids)}편)")
+    categories = fetch_arxiv_categories_batch(arxiv_ids)
+
+    definitely_in, ambiguous = [], []
+    for paper in papers:
+        cats = set(categories.get(paper["id"], []))
+        if cats & NLP_PRIMARY_CATS:
+            definitely_in.append(paper)
+        elif cats & NLP_AMBIGUOUS_CATS or not cats:
+            ambiguous.append(paper)
+
+    print(f"  cs.CL 확정: {len(definitely_in)}편 | 2차 판별 대상: {len(ambiguous)}편")
+
+    if ambiguous:
+        print(f"  [2/2] Claude Haiku로 {len(ambiguous)}편 분류 중...")
+        claude_selected = classify_with_claude_haiku(ambiguous, client)
+        print(f"  Claude 선정: {len(claude_selected)}편")
+        definitely_in.extend(claude_selected)
+
+    return definitely_in
 
 
 def fetch_daily_papers(date: str = None) -> list:
@@ -433,10 +508,7 @@ def main():
 
     papers = fetch_daily_papers(str(today))
 
-    llm_papers = [
-        p for p in papers
-        if is_llm_nlp_paper(p.get("title", ""), p.get("summary", ""))
-    ]
+    llm_papers = filter_llm_papers(papers, client)
     llm_papers.sort(key=lambda p: p.get("upvotes", 0), reverse=True)
     llm_papers = llm_papers[:MAX_PAPERS]
 
