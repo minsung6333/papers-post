@@ -163,16 +163,15 @@ def fetch_arxiv_content(arxiv_id: str) -> dict:
     if current_text:
         sections[current_section] = " ".join(current_text).strip()
 
-    figures = []
+    raw_figures = []
     for img in soup.select("figure img, .ltx_figure img"):
         src = img.get("src", "")
         if src:
-            if src.startswith("http"):
-                figures.append(src)
-            else:
-                figures.append(f"https://arxiv.org/html/{arxiv_id}/{src.lstrip('/')}")
+            url = src if src.startswith("http") else f"https://arxiv.org/html/{arxiv_id}/{src.lstrip('/')}"
+            raw_figures.append(url)
 
     captions = [cap.get_text(" ", strip=True)[:300] for cap in soup.select("figcaption")]
+    figures = _filter_accessible_images(raw_figures)
 
     return {
         "sections": sections,
@@ -180,6 +179,22 @@ def fetch_arxiv_content(arxiv_id: str) -> dict:
         "captions": captions,
         "full_text": soup.get_text(" ", strip=True)[:15000],
     }
+
+
+def _filter_accessible_images(urls: list, max_check: int = 6, timeout: int = 5) -> list:
+    """실제로 로드 가능한 이미지 URL만 반환"""
+    valid = []
+    for url in urls[:max_check]:
+        try:
+            resp = requests.head(url, timeout=timeout, allow_redirects=True,
+                                 headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code == 200:
+                ct = resp.headers.get("content-type", "")
+                if "image" in ct or any(url.lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".gif", ".webp")):
+                    valid.append(url)
+        except Exception:
+            pass
+    return valid
 
 
 # ============================================================
@@ -193,13 +208,15 @@ def generate_korean_post(paper: dict, arxiv_content: dict, client: anthropic.Ant
     authors = ", ".join(a.get("name", "") for a in paper.get("authors", [])[:5])
     upvotes = paper.get("upvotes", 0)
     published = paper.get("publishedAt", "")[:10]
+    hf_thumbnail = paper.get("thumbnailUrl", "")
+
+    # HF 썸네일(항상 접근 가능)을 첫 번째로, 검증된 arXiv 그림을 이어서
+    all_figures = ([hf_thumbnail] if hf_thumbnail else []) + arxiv_content["figures"][:5]
+    all_captions = (["논문 요약 썸네일"] if hf_thumbnail else []) + (arxiv_content["captions"][:5] + [""]*5)
 
     figures_md = "\n".join(
         f'![Figure {i+1}: {cap[:100]}]({url})'
-        for i, (url, cap) in enumerate(
-            zip(arxiv_content["figures"][:6],
-                arxiv_content["captions"][:6] + [""]*6)
-        )
+        for i, (url, cap) in enumerate(zip(all_figures, all_captions))
     )
 
     sections_text = "\n\n".join(
@@ -250,7 +267,7 @@ def generate_korean_post(paper: dict, arxiv_content: dict, client: anthropic.Ant
 
     message = client.messages.create(
         model=MODEL,
-        max_tokens=4096,
+        max_tokens=8000,
         messages=[{"role": "user", "content": prompt}]
     )
     return message.content[0].text
