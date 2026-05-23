@@ -560,6 +560,59 @@ def slugify(title: str) -> str:
 
 
 # ============================================================
+# 토큰 만료 알림
+# ============================================================
+
+def check_token_expiry_and_notify(refresh_token: str) -> None:
+    """refresh_token 만료 7일 전 GitHub Issue 자동 생성"""
+    import base64, json as _json
+
+    payload_b64 = refresh_token.split(".")[1]
+    padding = (4 - len(payload_b64) % 4) % 4
+    payload = _json.loads(base64.b64decode(payload_b64 + "=" * padding))
+
+    exp_dt = datetime.datetime.fromtimestamp(payload["exp"], tz=datetime.timezone.utc)
+    days_left = (exp_dt - datetime.datetime.now(tz=datetime.timezone.utc)).days
+
+    print(f"Velog refresh_token: {days_left}days left (expires {exp_dt.strftime('%Y-%m-%d')})")
+
+    if days_left > 7:
+        return
+
+    github_token = os.environ.get("GITHUB_TOKEN", "")
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    if not github_token or not repo:
+        print(f"WARNING: Velog refresh_token expires in {days_left} days! Update GitHub Secrets.")
+        return
+
+    resp = requests.post(
+        f"https://api.github.com/repos/{repo}/issues",
+        headers={
+            "Authorization": f"Bearer {github_token}",
+            "Accept": "application/vnd.github+json",
+        },
+        json={
+            "title": f"[Action Required] Velog refresh_token expires in {days_left} days",
+            "body": (
+                f"## Velog 토큰 갱신 필요\n\n"
+                f"`refresh_token`이 **{days_left}일 후** 만료됩니다.\n\n"
+                f"**만료 일시**: {exp_dt.strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+                f"### 갱신 방법\n"
+                f"1. [velog.io](https://velog.io) 로그인\n"
+                f"2. F12 → Application → Cookies → `https://velog.io`\n"
+                f"3. `access_token`, `refresh_token` 값 복사\n"
+                f"4. GitHub Secrets → `VELOG_ACCESS_TOKEN`, `VELOG_REFRESH_TOKEN` 업데이트\n"
+            ),
+        },
+        timeout=30,
+    )
+    if resp.status_code == 201:
+        print(f"GitHub Issue created: {resp.json()['html_url']}")
+    else:
+        print(f"GitHub Issue creation failed: {resp.status_code}")
+
+
+# ============================================================
 # 메인
 # ============================================================
 
@@ -582,6 +635,10 @@ def main():
 
     use_notion = bool(notion_key and notion_db_id)
     use_velog = bool(velog_access and velog_refresh)
+
+    if velog_refresh:
+        check_token_expiry_and_notify(velog_refresh)
+
     client = anthropic.Anthropic(api_key=anthropic_key)
 
     today = datetime.date.today()
