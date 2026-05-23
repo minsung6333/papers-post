@@ -265,12 +265,27 @@ def generate_korean_post(paper: dict, arxiv_content: dict, client: anthropic.Ant
 각 섹션을 충분히 자세하게 설명하되, 전문 용어는 한국어 번역 후 영문 병기 형식(예: 강화학습(Reinforcement Learning))으로 표기하세요.
 독자가 원문 없이도 논문의 핵심을 완전히 이해할 수 있도록 작성하세요."""
 
-    message = client.messages.create(
-        model=MODEL,
-        max_tokens=8000,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return message.content[0].text
+    messages = [{"role": "user", "content": prompt}]
+    full_text = ""
+
+    for turn in range(1, 6):  # 최대 5회 = ~40000 토큰
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=8000,
+            messages=messages,
+        )
+        chunk = response.content[0].text
+        full_text += chunk
+
+        if response.stop_reason != "max_tokens":
+            print(f"  generation complete ({turn} turn{'s' if turn > 1 else ''})")
+            break
+
+        print(f"  turn {turn} done, continuing...")
+        messages.append({"role": "assistant", "content": chunk})
+        messages.append({"role": "user", "content": "계속 작성해주세요."})
+
+    return full_text
 
 
 # ============================================================
