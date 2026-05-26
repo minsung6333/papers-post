@@ -290,16 +290,20 @@ def _extract_tags(post_content: str) -> list:
 
 
 def refresh_velog_token(refresh_token: str) -> str:
-    """refresh_token으로 새 access_token 발급"""
-    query = "mutation RefreshToken { refreshToken { access_token refresh_token } }"
-    resp = requests.post(
-        VELOG_GQL,
-        json={"query": query},
-        headers={"Content-Type": "application/json", "cookie": f"refresh_token={refresh_token}"},
+    """refresh_token으로 새 access_token 발급.
+    v3.velog.io/api/auth/refresh 는 404를 반환하지만
+    Set-Cookie 헤더에 새 access_token을 담아줌."""
+    resp = requests.get(
+        "https://v3.velog.io/api/auth/refresh",
+        headers={"cookie": f"refresh_token={refresh_token}"},
         timeout=30,
+        allow_redirects=True,
     )
-    resp.raise_for_status()
-    return resp.json()["data"]["refreshToken"]["access_token"]
+    new_token = resp.cookies.get("access_token")
+    if not new_token:
+        raise Exception(f"Token refresh failed (status={resp.status_code})")
+    print("  Velog token refreshed successfully")
+    return new_token
 
 
 def post_to_velog(paper: dict, post_content: str, access_token: str, refresh_token: str) -> str:
