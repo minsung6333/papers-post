@@ -307,7 +307,10 @@ def refresh_velog_token(refresh_token: str) -> str:
 
 
 def post_to_velog(paper: dict, post_content: str, access_token: str, refresh_token: str) -> str:
-    """Velog에 포스트 업로드, access_token 만료 시 자동 갱신"""
+    """Velog에 포스트 업로드.
+    브라우저 재로그인 등으로 access_token이 서버 측에서 무효화될 수 있으므로,
+    항상 refresh_token으로 새 access_token을 먼저 발급한 뒤 포스팅합니다.
+    refresh 실패 시 기존 access_token으로 폴백합니다."""
     title = paper.get("title", "")
     url_slug = slugify(title)
     tags = _extract_tags(post_content)
@@ -336,7 +339,8 @@ def post_to_velog(paper: dict, post_content: str, access_token: str, refresh_tok
         }
     }
 
-    def _do_post(token: str) -> dict:
+    def _do_post(token: str) -> dict | None:
+        """포스트 요청. 빈 응답(토큰 무효화) 또는 에러 시 None 반환."""
         resp = requests.post(
             VELOG_GQL,
             json={"query": mutation, "variables": variables},
@@ -344,14 +348,30 @@ def post_to_velog(paper: dict, post_content: str, access_token: str, refresh_tok
             timeout=30,
         )
         resp.raise_for_status()
-        return resp.json()
+        if not resp.content:
+            return None  # 서버 측 토큰 무효화 시 빈 body 반환
+        data = resp.json()
+        if "errors" in data:
+            return None  # GraphQL 인증 오류
+        return data
 
-    data = _do_post(access_token)
+    # 1) 항상 먼저 refresh → 서버 측 무효화된 토큰 문제를 원천 차단
+    try:
+        fresh_token = refresh_velog_token(refresh_token)
+    except Exception as e:
+        print(f"  Token refresh 실패 → 기존 access_token 사용: {e}")
+        fresh_token = access_token
 
-    if "errors" in data:
-        print(f"  access_token 만료 → refresh 시도 중...")
-        new_token = refresh_velog_token(refresh_token)
-        data = _do_post(new_token)
+    # 2) 새 토큰으로 포스팅
+    data = _do_post(fresh_token)
+
+    # 3) 그래도 실패하면 원래 토큰으로 한 번 더 시도
+    if data is None and fresh_token != access_token:
+        print("  Refreshed token 실패 → 기존 access_token으로 재시도...")
+        data = _do_post(access_token)
+
+    if data is None:
+        raise Exception("Velog writePost 실패: 인증 오류 (토큰 만료 또는 권한 없음)")
 
     post = data["data"]["writePost"]
     username = post["user"]["username"]
