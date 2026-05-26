@@ -122,15 +122,29 @@ def filter_llm_papers(papers: list, client: anthropic.Anthropic) -> list:
     return definitely_in
 
 
-def fetch_daily_papers(date: str = None) -> list:
-    if date is None:
-        date = datetime.date.today().strftime("%Y-%m-%d")
-    url = f"https://huggingface.co/api/papers?date={date}"
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
-    papers = resp.json()
-    print(f"[{date}] 총 {len(papers)}편 논문 로드")
-    return papers
+def fetch_daily_papers(date: str = None) -> tuple:
+    """오늘부터 최대 7일 전까지 거슬러 올라가며 논문이 있는 날짜 반환.
+    Returns (papers, fetch_date) tuple."""
+    if date is not None:
+        url = f"https://huggingface.co/api/papers?date={date}"
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        papers = resp.json()
+        print(f"[{date}] {len(papers)} papers loaded")
+        return papers, date
+
+    for days_back in range(7):
+        d = (datetime.date.today() - datetime.timedelta(days=days_back)).strftime("%Y-%m-%d")
+        resp = requests.get(f"https://huggingface.co/api/papers?date={d}", timeout=30)
+        resp.raise_for_status()
+        papers = resp.json()
+        if papers:
+            if days_back > 0:
+                print(f"No papers for today, using {d} ({days_back} days back)")
+            print(f"[{d}] {len(papers)} papers loaded")
+            return papers, d
+
+    return [], datetime.date.today().strftime("%Y-%m-%d")
 
 
 def fetch_arxiv_content(arxiv_id: str) -> dict:
@@ -177,13 +191,14 @@ def fetch_arxiv_content(arxiv_id: str) -> dict:
 # 한국어 포스트 생성 (Claude API)
 # ============================================================
 
-def generate_korean_post(paper: dict, arxiv_content: dict, client: anthropic.Anthropic) -> str:
+def generate_korean_post(paper: dict, arxiv_content: dict, client: anthropic.Anthropic, fetch_date: str = None) -> str:
     title = paper.get("title", "")
     arxiv_id = paper.get("id", "")
     abstract = paper.get("summary", "")
     authors = ", ".join(a.get("name", "") for a in paper.get("authors", [])[:5])
     upvotes = paper.get("upvotes", 0)
     published = paper.get("publishedAt", "")[:10]
+    featured_date = fetch_date or datetime.date.today().strftime("%Y-%m-%d")
     hf_thumbnail = paper.get("thumbnailUrl", "")
 
     # HF 썸네일만 신뢰성 있는 이미지로 사용
@@ -202,7 +217,7 @@ def generate_korean_post(paper: dict, arxiv_content: dict, client: anthropic.Ant
 - 제목: {title}
 - arXiv ID: {arxiv_id}
 - 저자: {authors}
-- 발표일: {published} | 업보트: {upvotes}
+- HF 피처일: {featured_date} | arXiv 발표일: {published} | 업보트: {upvotes}
 - HuggingFace: https://huggingface.co/papers/{arxiv_id}
 - arXiv HTML: https://arxiv.org/html/{arxiv_id}
 
@@ -561,8 +576,10 @@ def post_to_notion(paper: dict, post_content: str, notion_api_key: str, database
 
     if thumbnail:
         page_data["cover"] = {"type": "external", "external": {"url": thumbnail}}
-    if published:
-        page_data["properties"]["Published"] = {"date": {"start": published}}
+    # HF 피처일 우선, 없으면 arXiv 발표일
+    date_to_use = paper.get("fetch_date") or published
+    if date_to_use:
+        page_data["properties"]["Published"] = {"date": {"start": date_to_use}}
 
     resp = requests.post("https://api.notion.com/v1/pages", headers=headers, json=page_data)
     resp.raise_for_status()
@@ -680,24 +697,24 @@ def main():
 
     client = anthropic.Anthropic(api_key=anthropic_key)
 
-    today = datetime.date.today()
+    papers, fetch_date = fetch_daily_papers()
+    today = datetime.date.fromisoformat(fetch_date)
+
     print(f"\nHuggingFace Daily Papers blog auto-generation")
-    print(f"Date: {today}")
+    print(f"Fetch date: {fetch_date}")
     print(f"Notion: {'ON' if use_notion else 'OFF'} | Velog: {'ON' if use_velog else 'OFF'}\n")
 
     if SAVE_LOCAL:
         output_dir = OUTPUT_DIR / str(today.year) / f"{today.month:02d}"
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    papers = fetch_daily_papers(str(today))
-
     llm_papers = filter_llm_papers(papers, client)
     llm_papers.sort(key=lambda p: p.get("upvotes", 0), reverse=True)
     llm_papers = llm_papers[:MAX_PAPERS]
 
-    print(f"🔍 LLM/NLP 관련 논문: {len(llm_papers)}편 선정\n")
+    print(f"Selected {len(llm_papers)} LLM/NLP papers\n")
     for idx, p in enumerate(llm_papers, 1):
-        print(f"  {idx}. [{p.get('upvotes',0):3d}👍] {p['title'][:70]}")
+        print(f"  {idx}. [{p.get('upvotes',0):3d}] {p['title'][:70]}")
     print()
 
     success = 0
@@ -706,22 +723,23 @@ def main():
         title = paper.get("title", "")
         print(f"\n[{i}/{len(llm_papers)}] {title[:60]}...")
 
-        print(f"  📄 arXiv 로드 중...")
+        print(f"  Loading arXiv...")
         arxiv_content = fetch_arxiv_content(arxiv_id)
         time.sleep(2)
 
-        print(f"  ✍️  Claude로 번역 생성 중...")
+        paper["fetch_date"] = fetch_date  # Notion Published 날짜용
+        print(f"  Generating Korean post with Claude...")
         try:
-            post_content = generate_korean_post(paper, arxiv_content, client)
+            post_content = generate_korean_post(paper, arxiv_content, client, fetch_date)
         except Exception as e:
-            print(f"  ❌ 포스트 생성 실패: {e}")
+            print(f"  Post generation failed: {e}")
             continue
 
         if SAVE_LOCAL:
-            filename = f"{today}-{slugify(title)}.md"
+            filename = f"{fetch_date}-{slugify(title)}.md"
             filepath = output_dir / filename
             filepath.write_text(post_content, encoding="utf-8")
-            print(f"  💾 로컬 저장: {filepath}")
+            print(f"  Saved locally: {filepath}")
 
         if use_notion:
             try:
